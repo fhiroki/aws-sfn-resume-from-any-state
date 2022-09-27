@@ -1,23 +1,32 @@
 import argparse
 import json
+import sys
 
 import boto3
 
-client = boto3.client('stepfunctions')
+client = boto3.client("stepfunctions")
 
 
-def sm_arn_from_execution_arn(arn):
+def create_new_sm_name(original_name: str) -> str:
+    *base, suffix = original_name.split("-")
+    if suffix.isdecimal():
+        base_name = "-".join(base)
+        return f"{base_name}-{int(suffix) + 1}"
+    return f"{original_name}-1"
+
+
+def sm_arn_from_execution_arn(arn: str) -> str:
     """
     Get the State Machine Arn from the execution Arn
     Input: Execution Arn of a state machine
     Output: Arn of the state machine
     """
-    sm_arn = arn.split(':')[:-1]
-    sm_arn[5] = 'stateMachine'
-    return ':'.join(sm_arn)
+    sm_arn = arn.split(":")[:-1]
+    sm_arn[5] = "stateMachine"
+    return ":".join(sm_arn)
 
 
-def parse_failure_history(failed_execution_arn):
+def parse_failure_history(failed_execution_arn: str) -> tuple[str, dict]:
     """
     Parses the execution history of a failed state machine to get the name of failed state and
     the input to the failed state
@@ -26,16 +35,13 @@ def parse_failure_history(failed_execution_arn):
     """
 
     failed_events = list()
-    failed_at_parallel_state = False
+    failed_at_parallel_or_map_state = False
 
     try:
         # Get the execution history
-        response = client.get_execution_history(
-            executionArn=failed_execution_arn,
-            reverseOrder=True
-        )
-        next_token = response.get('nextToken')
-        failed_events.extend(response['events'])
+        response = client.get_execution_history(executionArn=failed_execution_arn, reverseOrder=True)
+        next_token = response.get("nextToken")
+        failed_events.extend(response["events"])
     except Exception as ex:
         raise ex
 
@@ -45,130 +51,170 @@ def parse_failure_history(failed_execution_arn):
             response = client.get_execution_history(
                 executionArn=failed_execution_arn,
                 reverseOrder=True,
-                nextToken=next_token
+                nextToken=next_token,
             )
-            next_token = response.get('nextToken')
-            failed_events.extend(response['events'])
+            next_token = response.get("nextToken")
+            failed_events.extend(response["events"])
         except Exception as ex:
             raise ex
 
+    # 実行を停止した場合、中断したステップから再開する
+    if failed_events[0]["type"] == "ExecutionAborted":
+        for current_event in failed_events:
+            if current_event["type"] == "TaskStateEntered":
+                failed_state = current_event["stateEnteredEventDetails"]["name"]
+                failed_input = json.loads(current_event["stateEnteredEventDetails"]["input"])
+                return failed_state, failed_input
+
     # Confirm that the execution actually failed, raise exception if it didn't fail
     try:
-        failed_events[0]['executionFailedEventDetails']
+        failed_events[0]["executionFailedEventDetails"]
     except Exception as cause:
-        raise Exception('Execution did not fail', cause)
-    '''
+        raise Exception("Execution did not fail", cause)
+
+    """
     If we have a 'States.Runtime' error (for example if a task state in our state
     machine attempts to execute a lambda function in a different region than the
     state machine, get the id of the failed state, use id of the failed state to
     determine failed state name and input
-    '''
-    if failed_events[0]['executionFailedEventDetails']['error'] == 'States.Runtime':
-        failed_id = int(filter(str.isdigit, str(failed_events[0]['executionFailedEventDetails']['cause'].split()[13])))
-        failed_state = failed_events[-1 * failed_id]['stateEnteredEventDetails']['name']
-        failed_input = failed_events[-1 * failed_id]['stateEnteredEventDetails']['input']
+    """
+    if failed_events[0]["executionFailedEventDetails"]["error"] == "States.Runtime":
+        failed_id = int(
+            # get first element
+            next(
+                filter(
+                    str.isdigit,
+                    str(failed_events[0]["executionFailedEventDetails"]["cause"].split()[13]),
+                )
+            )
+        )
+        failed_state = failed_events[-1 * failed_id]["stateEnteredEventDetails"]["name"]
+        failed_input = json.loads(failed_events[-1 * failed_id]["stateEnteredEventDetails"]["input"])
         return failed_state, failed_input
-    '''
+
+    """
     We need to loop through the execution history, tracing back the executed steps
     The first state we encounter will be the failed state
-    If we failed on a parallel state, we need the name of the parallel state rather than the
-    name of a state within a parallel state it failed on. This is because we can only attach
-    the goToState to the parallel state, but not a sub-state within the parallel state.
+    If we failed on a parallel or map state, we need the name of the parallel or map state rather than the
+    name of a state within a parallel or map state it failed on. This is because we can only attach
+    the goToState to the parallel or map state, but not a sub-state within the parallel or map state.
     This loop starts with the id of the latest event and uses the previous event id's to trace
     back the execution to the beginning (id 0). However, it will return as soon it finds the name
     of the failed state
-    '''
-    current_event_id = failed_events[0]['id']
+    """
+    current_event_id = failed_events[0]["id"]
+    succeed_index_list = []
     while current_event_id != 0:
         # multiply event id by -1 for indexing because we're looking at the reversed history
         current_event = failed_events[-1 * current_event_id]
-        '''
-        We can determine if the failed state was a parallel state because it an event
-        with 'type'='ParallelStateFailed' will appear in the execution history before
+
+        """
+        We can determine if the failed state was a parallel or map state because it an event
+        with 'type'='ParallelStateFailed' or 'MapStateFailed' will appear in the execution history before
         the name of the failed state
-        '''
-        if current_event['type'] == 'ParallelStateFailed':
-            failed_at_parallel_state = True
-        '''
-        If the failed state is not a parallel state, then the name of failed state to return
+        """
+        if current_event["type"] in ["ParallelStateFailed", "MapStateFailed"]:
+            failed_at_parallel_or_map_state = True
+
+        if current_event["type"] == "TaskStateEntered":
+            succeed_index = json.loads(current_event["stateEnteredEventDetails"]["input"])["index"]
+            succeed_index_list.append(succeed_index)
+
+        """
+        If the failed state is not a parallel or map state, then the name of failed state to return
         will be the name of the state in the first 'TaskStateEntered' event type we run into
         when tracing back the execution history
-        '''
-        if current_event['type'] == 'TaskStateEntered' and not failed_at_parallel_state:
-            failed_state = current_event['stateEnteredEventDetails']['name']
-            failed_input = current_event['stateEnteredEventDetails']['input']
+        """
+        if current_event["type"] == "TaskStateEntered" and not failed_at_parallel_or_map_state:
+            failed_state = current_event["stateEnteredEventDetails"]["name"]
+            failed_input = json.loads(current_event["stateEnteredEventDetails"]["input"])
             return failed_state, failed_input
-        '''
-        If the failed state was a parallel state, then we need to trace execution back to
-        the first event with 'type'='ParallelStateEntered', and return the name of the state
-        '''
-        if current_event['type'] == 'ParallelStateEntered' and failed_at_parallel_state:
-            failed_state = current_event['stateEnteredEventDetails']['name']
-            failed_input = current_event['stateEnteredEventDetails']['input']
+
+        """
+        If the failed state was a parallel or map state, then we need to trace execution back to
+        the first event with 'type'='ParallelStateEntered' or 'MapStateEntered', and return the name of the state
+        """
+        if current_event["type"] in ["ParallelStateEntered", "MapStateEntered"] and failed_at_parallel_or_map_state:
+            failed_state = current_event["stateEnteredEventDetails"]["name"]
+            failed_input = json.loads(current_event["stateEnteredEventDetails"]["input"])
+
+            # Mapで順列処理の場合
+            if current_event["type"] == "MapStateEntered":
+                # 最初に追加された番号は失敗しているので除く。
+                succeed_index_list.pop(0)
+                for succeed_index in succeed_index_list:
+                    # 既に成功している番号を再実行しないために、次回実行時のinputから除外する。
+                    failed_input["index"].remove(succeed_index)
+
             return failed_state, failed_input
+
         # Update the id for the next execution of the loop
-        current_event_id = current_event['previousEventId']
+        current_event_id = current_event["previousEventId"]
+
+    raise Exception("Failed to parse history")
 
 
-def attach_go_to_state(failed_state_name, state_machine_arn):
+def attach_go_to_state(failed_state_name: str, state_machine_arn: str) -> dict:
     """
     Given a state machine arn and the name of a state in that state machine, create a new state machine
     that starts at a new choice state called the 'GoToState'. The "GoToState" will branch to the named
     state, and send the input of the state machine to that state, when a variable called "resuming" is
-    set to True
+    set to True. By default "resuming" is set to True.
     Input   failedStateName - string with the name of the failed state
             stateMachineArn - string with the Arn of the state machine
     Output  response from the create_state_machine call, which is the API call that creates a new state machine
     """
     try:
-        response = client.describe_state_machine(
-            stateMachineArn=state_machine_arn
-        )
+        response = client.describe_state_machine(stateMachineArn=state_machine_arn)
     except Exception as cause:
-        raise Exception('Could not get ASL definition of state machine', cause)
-    role_arn = response['roleArn']
-    state_machine = json.loads(response['definition'])
+        raise Exception("Could not get ASL definition of state machine", cause)
+    role_arn = response["roleArn"]
+    state_machine = json.loads(response["definition"])
     # Create a name for the new state machine
-    new_name = response['name'] + '-with-GoToState'
+    new_name = create_new_sm_name(response["name"])
+
     # Get the StartAt state for the original state machine, because we will point the 'GoToState' to this state
-    original_start_at = state_machine['StartAt']
-    '''
+    original_start_at = state_machine["StartAt"]
+    """
     Create the GoToState with the variable $.resuming
     If new state machine is executed with $.resuming = True, then the state machine will skip to the failed state
     Otherwise, it will execute the state machine from the original start state
-    '''
-    go_to_state = {
-        'Type': 'Choice',
-        'Choices': [{'Variable': '$.resuming', 'BooleanEquals': False, 'Next': original_start_at}],
-        'Default': failed_state_name
-    }
-    # Add GoToState to the set of states in the new state machine
-    state_machine['States']['GoToState'] = go_to_state
-    # Add StartAt
-    state_machine['StartAt'] = 'GoToState'
+    """
+    if original_start_at == "GoToState":
+        # ２回目以降の場合は遷移先を差し替える
+        state_machine["States"]["GoToState"]["Default"] = failed_state_name
+    else:
+        go_to_state = {
+            "Type": "Choice",
+            "Choices": [{"Variable": "$.resuming", "BooleanEquals": False, "Next": original_start_at}],
+            "Default": failed_state_name,
+        }
+        # Add GoToState to the set of states in the new state machine
+        state_machine["States"]["GoToState"] = go_to_state
+        # Add StartAt
+        state_machine["StartAt"] = "GoToState"
+
     # Create new state machine
     try:
-        response = client.create_state_machine(
-            name=new_name,
-            definition=json.dumps(state_machine),
-            roleArn=role_arn
-        )
+        response = client.create_state_machine(name=new_name, definition=json.dumps(state_machine), roleArn=role_arn)
     except Exception as cause:
-        raise Exception('Failed to create new state machine with GoToState', cause)
+        raise Exception("Failed to create new state machine with GoToState", cause)
     return response
 
 
-if __name__ == '__main__':
-    '''
-    Main
-    Run as:
-    python gotostate.py --failedExecutionArn '<Failed_Execution_Arn>'"
-    '''
-    parser = argparse.ArgumentParser(description='Execution Arn of the failed state machine.')
-    parser.add_argument('--failedExecutionArn', dest='failedExecutionArn', type=str)
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python gotostate.py --failedExecutionArn '<Failed_Execution_Arn>'")
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(description="Execution Arn of the failed state machine.")
+    parser.add_argument("--failedExecutionArn", dest="failedExecutionArn", type=str, required=True)
     args = parser.parse_args()
+
     failed_sm_state, failed_sm_info = parse_failure_history(args.failedExecutionArn)
+    failed_sm_info["resuming"] = True
     failed_sm_arn = sm_arn_from_execution_arn(args.failedExecutionArn)
     new_machine = attach_go_to_state(failed_sm_state, failed_sm_arn)
-    print("New State Machine Arn: {}".format(new_machine['stateMachineArn']))
-    print("Execution had failed at state: {} with Input: {}".format(failed_sm_state, failed_sm_info))
+
+    print(f"New State Machine Arn: {new_machine['stateMachineArn']}")
+    print(f"新しく生成されたステートマシンの実行開始時に以下を入力してください。: \n{json.dumps(failed_sm_info)}")
