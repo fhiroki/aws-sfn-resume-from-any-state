@@ -79,15 +79,10 @@ def parse_failure_history(failed_execution_arn: str) -> tuple[str, dict]:
     determine failed state name and input
     """
     if failed_events[0]["executionFailedEventDetails"]["error"] == "States.Runtime":
-        failed_id = int(
-            # get first element
-            next(
-                filter(
-                    str.isdigit,
-                    str(failed_events[0]["executionFailedEventDetails"]["cause"].split()[13]),
-                )
-            )
-        )
+        failed_id = int("".join(filter(
+            str.isdigit,
+            str(failed_events[0]["executionFailedEventDetails"]["cause"].split()[13]),
+        )))
         failed_state = failed_events[-1 * failed_id]["stateEnteredEventDetails"]["name"]
         failed_input = json.loads(failed_events[-1 * failed_id]["stateEnteredEventDetails"]["input"])
         return failed_state, failed_input
